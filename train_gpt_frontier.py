@@ -67,7 +67,7 @@ class Hyperparameters:
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 50))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -97,16 +97,16 @@ class Hyperparameters:
     smeargate: bool = bool(int(os.environ.get("SMEARGATE", "1")))
     skip_gates: bool = bool(int(os.environ.get("SKIP_GATES", "1")))
 
-    # QAT
+    # QAT — enabled after this fraction of total steps (not lr_mul based)
     qat_enabled: bool = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_late_frac: float = float(os.environ.get("QAT_LATE_FRAC", 0.15))  # enable at last 15% of warmdown
+    qat_start_frac: float = float(os.environ.get("QAT_START_FRAC", 0.85))  # enable at 85% of training
 
     # EMA
     ema_enabled: bool = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay: float = float(os.environ.get("EMA_DECAY", 0.997))
 
-    # Sliding window eval
-    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64))  # 0 = standard eval
+    # Sliding window eval (default off — enable for final 8xH100 submission runs)
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))  # 0 = standard eval, 64 = sliding window
 
     # Optimizer
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -903,6 +903,14 @@ def main() -> None:
     model = GPT(args).to(DEVICE)
     opt = SplitOptimizers(model, args)
 
+    # torch.compile for faster steps (Linux/CUDA only, skip on Windows/CPU)
+    use_compile = DEVICE.type == "cuda" and sys.platform != "win32"
+    if use_compile:
+        model = torch.compile(model)
+        log("torch.compile:enabled")
+    else:
+        log("torch.compile:disabled (Windows or CPU)")
+
     # EMA setup
     ema_state: dict[str, Tensor] | None = None
     if args.ema_enabled:
@@ -915,7 +923,7 @@ def main() -> None:
     log(f"model_params:{n_params} layers:{args.num_layers} dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads}")
     log(f"mlp_hidden:{args.mlp_hidden} rope_dims:{args.rope_dims} xsa_layers:{args.xsa_layers}")
     log(f"value_residual:{args.value_residual} bigram_buckets:{args.bigram_buckets} smeargate:{args.smeargate} skip_gates:{args.skip_gates}")
-    log(f"qat:{args.qat_enabled}(late_frac={args.qat_late_frac}) ema:{args.ema_enabled}(decay={args.ema_decay})")
+    log(f"qat:{args.qat_enabled}(start_frac={args.qat_start_frac}) ema:{args.ema_enabled}(decay={args.ema_decay})")
     log(f"eval_stride:{args.eval_stride} grad_clip:{args.grad_clip_norm} weight_decay:{args.weight_decay}")
     log(f"train_batch_tokens:{args.train_batch_tokens} seq_len:{args.train_seq_len} iterations:{args.iterations}")
     log(f"muon_lr:{args.matrix_lr} embed_lr:{args.tied_embed_lr} scalar_lr:{args.scalar_lr} muon_momentum:{args.muon_momentum}")
@@ -962,11 +970,17 @@ def main() -> None:
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
 
-        # Late QAT: enable when entering final fraction of warmdown
-        if args.qat_enabled and not qat_active and lr_mul < args.qat_late_frac:
-            CastedLinear._qat_enabled = True
-            qat_active = True
-            log(f"qat:enabled at step:{step} lr_mul:{lr_mul:.4f}")
+        # Late QAT: enable after qat_start_frac of estimated total steps
+        if args.qat_enabled and not qat_active:
+            # Estimate total steps from wallclock: how many steps can we fit?
+            elapsed_so_far = train_time_ms + 1000.0 * (time.perf_counter() - t0)
+            step_ms_avg = elapsed_so_far / max(step, 1)
+            estimated_total = int(1000.0 * args.max_wallclock_seconds / max(step_ms_avg, 1)) if args.max_wallclock_seconds > 0 else args.iterations
+            qat_trigger = int(estimated_total * args.qat_start_frac)
+            if step >= qat_trigger and step > 10:
+                CastedLinear._qat_enabled = True
+                qat_active = True
+                log(f"qat:enabled at step:{step} (trigger:{qat_trigger} est_total:{estimated_total})")
 
         step_t0 = time.perf_counter()
         model.zero_grad()
